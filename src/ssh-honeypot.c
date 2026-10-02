@@ -47,7 +47,7 @@
 /* Globals */
 char           *logfile             = LOGFILE;
 char           *pidfile             = PIDFILE;
-char           *rsakey              = RSAKEY;
+char           *host_key_prefix     = KEY_PREFIX;
 char           *bindaddr            = BINDADDR;
 uint16_t		port         		= PORT;
 bool            console_output      = true;
@@ -65,21 +65,24 @@ char            hostname[MAXHOSTNAMELEN];
 
 bool			hassh_server		= false;
 
+#define num_key_types 3
+const char key_types[num_key_types][8] = {"ed25519", "ecdsa", "rsa"};
+char* host_keys[num_key_types] = {NULL, NULL, NULL};
 
 /* Banners */
 static struct banner_info_s {
 	const char	*str, *info;
 } banners[] = {
 	{"",  "No banner"},
-	{"OpenSSH_5.9p1 Debian-5ubuntu1.4", "Ubuntu 12.04"},
-	{"OpenSSH_7.2p2 Ubuntu-4ubuntu2.1", "Ubuntu 16.04"},
 	{"OpenSSH_7.6p1 Ubuntu-4ubuntu0.3", "Ubuntu 18.04"},
 	{"OpenSSH_8.2p1 Ubuntu-4ubuntu0.4", "Ubuntu 20.04"},
 	{"OpenSSH_6.6.1",                   "openSUSE 42.1"},
-	{"OpenSSH_6.7p1 Debian-5+deb8u3",   "Debian 8.6"},
+	{"OpenSSH_9.2p1 Debian-2+deb12u10", "Debian 12"},
+	{"OpenSSH_10.0p2 Debian-7+deb13u4", "Debian 13.6"},
 	{"OpenSSH_7.5",                     "pfSense 2.4.4-RELEASE-p3"},
 	{"dropbear_2014.63",                "dropbear 2014.63"},
-	{"OpenSSH_6.7p1 Raspbian-5+deb8u4", "Rapberry Pi"},
+	{"OpenSSH_6.7p1 Raspbian-5+deb8u4", "Raspberry Pi (old)"},
+	{"OpenSSH_8.4p1 Raspbian-5+b1"    , "Raspberry Pi (Raspbian 11)"},
 	{"ROSSSH",                          "MikroTik"},
 };
 
@@ -92,14 +95,13 @@ static void usage(const char *progname) {
 	fprintf(stderr, "ssh-honeypot %s\n\n", VERSION);
 	//TODO check make sure all of this actually jives with reality.
 	fprintf(stderr, "usage: %s "
-			"[-?h -p <port> -a <address> -b <index> -l <file> -r <file> "
+			"[-?h -p <port> -a <address> -b <index> -l <file> -K <prefix> "
 			"-f <file> -u <user>]\n",
 			progname);
 	fprintf(stderr, "\t-?/-h\t\t-- this help menu\n");
 	fprintf(stderr, "\t-p <port>\t-- listen port\n");
 	fprintf(stderr, "\t-a <address>\t-- IP address to bind to\n");
 	fprintf(stderr, "\t-d\t\t-- daemonize process\n");
-	fprintf(stderr, "\t-f\t\t-- PID file\n");
 	fprintf(stderr, "\t-L\t\t-- toggle logging to a file. Default: %s\n",
 			logging ? "on" : "off");
 	fprintf(stderr, "\t-l <file>\t-- log file\n");
@@ -107,7 +109,7 @@ static void usage(const char *progname) {
 			use_syslog ? "on" : "off");
 	fprintf(stderr, "\t-t\t\t-- authentication timeout. Default: %d\n",
 			TIMEOUT);
-	fprintf(stderr, "\t-r <file>\t-- specify RSA key to use\n");
+	fprintf(stderr, "\t-K <prefix>\t-- host key prefix: loads <prefix>.ed25519 <prefix>.ecdsa <prefix>.rsa as host keys\n");
 	fprintf(stderr, "\t-f <file>\t-- specify location to PID file\n");
 	fprintf(stderr, "\t-b\t\t-- list available banners\n");
 	fprintf(stderr, "\t-b <string>\t-- specify banner string (max 255 characters)\n");
@@ -736,9 +738,13 @@ int main(int argc, char *argv[]) {
 	ssh_session		session;
 	ssh_bind		sshbind;
 	long			timeout      = TIMEOUT;
+	int             i;
+	int             result;
+	int             keys_loaded  = 0;
+	size_t          prefix_len   = strlen(KEY_PREFIX);
 
 
-	while ((opt = getopt(argc, argv, "vh?p:dLl:a:b:i:r:f:su:j:J:P:")) != -1) {
+	while ((opt = getopt(argc, argv, "vh?p:dLl:a:b:i:K:f:su:j:J:P:")) != -1) {
 		switch (opt) {
 		case 'p': /* Listen port */
 			port = atoi(optarg);
@@ -761,8 +767,9 @@ int main(int argc, char *argv[]) {
 			bindaddr = optarg;
 			break;
 
-		case 'r': /* Path to RSA key */
-			rsakey = optarg;
+		case 'K': /* Host keys' path prefix */
+			host_key_prefix = optarg;
+			prefix_len = strlen(host_key_prefix);
 			break;
 
 		case 'f': /* PID file location */
@@ -882,7 +889,28 @@ int main(int argc, char *argv[]) {
 	ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDADDR, bindaddr);
 	ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDPORT, &port);
 	ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BANNER, banner);
-	ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_RSAKEY, rsakey);
+
+	for (i=0;i<num_key_types;i++) {
+		host_keys[i] = malloc(prefix_len + 16);
+		if (host_keys[i] == NULL) {
+			printf("FATAL: malloc() failed!\n");
+			return EXIT_FAILURE;
+		}
+		snprintf(host_keys[i], prefix_len + 16, "%s.%s", host_key_prefix, key_types[i]);
+		result = ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, host_keys[i]);
+		if (result == 0) {
+			printf("INFO: loaded SSH host key (%s): %s\n", key_types[i], host_keys[i]);
+			keys_loaded++;
+		} else {
+			printf("WARN: ssh_bind_options_set(HOSTKEY): %s\n", ssh_get_error(sshbind));
+			printf("WARN: (path attempted: %s )\n", host_keys[i]);
+		}
+	}
+
+	if (keys_loaded == 0) {
+		printf("FATAL: no host keys found!\n");
+		return EXIT_FAILURE;
+	}
 
 	if (ssh_bind_listen(sshbind) < 0) {
 		if (daemonize) // TODO: show meaningful error if key isn't supplied
@@ -924,5 +952,10 @@ int main(int argc, char *argv[]) {
 		hassh_server = true;
 	}
 
+	for (i=0;i<num_key_types;i++) {
+		if (host_keys[i] != NULL) {
+			free(host_keys[i]);
+		}
+	}
 	return EXIT_SUCCESS;
 }

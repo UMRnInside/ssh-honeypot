@@ -35,8 +35,18 @@ Build and Run
 ```
 make
 ssh-keygen -t rsa -f ./ssh-honeypot.rsa
-bin/ssh-honeypot -r ./ssh-honeypot.rsa
+ssh-keygen -t ecdsa -f ./ssh-honeypot.ecdsa
+ssh-keygen -t ed25519 -f ./ssh-honeypot.ed25519
+./bin/ssh-honeypot -K ./ssh-honeypot
 ```
+
+The `-K` option specifies the prefix for the SSH host key files. In this
+example, ssh-honeypot looks for `./ssh-honeypot.ed25519`,
+`./ssh-honeypot.ecdsa`, and `./ssh-honeypot.rsa`.
+
+You can provide one, two, or all three key types. Each file must contain a
+valid private host key of the type indicated by its extension. At least one
+key file must be available; otherwise, ssh-honeypot will fail to start.
 
 ### OSX (experimental/unsupported)
 
@@ -149,4 +159,3 @@ systemctl enable --now ssh-honeypot
 
 Before installing, check `ssh-honeypot.service` and modify it to run
 with the options you want.
-
