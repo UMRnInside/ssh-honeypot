@@ -21,6 +21,8 @@
 #include <time.h>
 #include <pwd.h>
 #include <grp.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <syslog.h>
 #include <sys/param.h>
 #include <sys/types.h>
@@ -29,17 +31,9 @@
 
 #include <libssh/libssh.h>
 #include <libssh/server.h>
+#include <libssh/callbacks.h>
 
 #include <json-c/json.h>
-
-/* needed for HASSH */
-#include <pcap.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
-#include <openssl/md5.h>
-#if OPENSSL_VERSION_NUMBER >= 0x030000000
-#include <openssl/evp.h>
-#endif /* OPENSSL_VERSION_NUMBER */
 
 #include "config.h"
 
@@ -63,11 +57,25 @@ bool            verbose             = false;
 int             json_sock;
 char            hostname[MAXHOSTNAMELEN];
 
-bool			hassh_server		= false;
-
 #define num_key_types 3
 const char key_types[num_key_types][8] = {"ed25519", "ecdsa", "rsa"};
 char* host_keys[num_key_types] = {NULL, NULL, NULL};
+
+/* Per-connection state for the single-process event loop. */
+struct client_session {
+	ssh_session			session;
+	ssh_event			event;
+	struct ssh_server_callbacks_struct callbacks;
+	char				ip[INET6_ADDRSTRLEN];
+	uint16_t			sport;
+	uint16_t			dport;
+	time_t				last_activity;
+	bool				kex_done;
+	struct client_session *next;
+};
+
+static struct client_session	*clients    = NULL;
+static long					session_timeout = TIMEOUT;
 
 /* Banners */
 static struct banner_info_s {
@@ -250,43 +258,6 @@ static void json_log_creds(const char *ip, const char *user, const char *pass) {
 }
 
 
-/* json_log_hassh() - log HASSHes
- */
-static void json_log_hassh(const char *hassh,
-						   const char *ip,
-						   const char *hassh_type,
-						   const uint16_t sport,
-						   const uint16_t ttl) {
-	char			*message;
-
-	json_object		*jobj    = json_object_new_object();
-	json_object		*j_time  = json_object_new_int(time(NULL));
-	json_object		*j_hassh = json_object_new_string(hassh);
-	json_object		*j_ip    = json_object_new_string(ip);
-	json_object		*j_sport = json_object_new_int(sport);
-	json_object		*j_ttl   = json_object_new_int(ttl);
-	json_object		*j_event = json_object_new_string(hassh_type);
-
-
-	json_object_object_add(jobj, "event", j_event);
-	json_object_object_add(jobj, "time", j_time);
-	json_object_object_add(jobj, "ip", j_ip);
-	json_object_object_add(jobj, "hassh", j_hassh);
-	json_object_object_add(jobj, "sport", j_sport);
-	json_object_object_add(jobj, "ttl", j_ttl);
-
-	message = (char *)json_object_to_json_string(jobj);
-
-	if (json_logging_file)
-		json_log(message);
-
-	if (json_logging_server)
-		sockprintf(json_sock, "%s\r\n", message);
-
-	json_object_put(jobj);
-}
-
-
 /* json_log_kex_error() -- log connections in JSON format
  */
 static void json_log_kex_error(const char *ip) {
@@ -369,248 +340,68 @@ static void json_log_session(const char *client_ip,
 }
 
 
-/* get_ssh_ip() -- obtains IP address via ssh_session
- */
-static char *get_ssh_ip(ssh_session session) {
-	static char					ip[INET6_ADDRSTRLEN];
-	struct sockaddr_storage		tmp;
-	struct in_addr				*inaddr;
-	struct in6_addr				*in6addr;
-	socklen_t					address_len = sizeof(tmp);
-
-
-	getpeername(ssh_get_fd(session), (struct sockaddr *)&tmp, &address_len);
-	inaddr = &((struct sockaddr_in *)&tmp)->sin_addr;
-	in6addr = &((struct sockaddr_in6 *)&tmp)->sin6_addr;
-	inet_ntop(tmp.ss_family,
-			  tmp.ss_family == AF_INET ? (void*)inaddr : (void*)in6addr,
-			  ip, sizeof(ip));
-
-  return ip;
-}
-
-
-static void md5_digest(const char *input, char *output, size_t len) {
-	uint8_t digest[MD5_DIGEST_LENGTH] = {0};
-
-#if OPENSSL_VERSION_NUMBER >= 0x030000000
-	EVP_Digest((const unsigned char *)input, len, digest, NULL, EVP_md5(), NULL);
-#else
-	MD5_CTX ctx;
-
-	MD5_Init(&ctx);
-	MD5_Update(&ctx, input, len);
-	MD5_Final(digest, &ctx);
-#endif /* OPENSSL_VERSION_NUMBER */
-	snprintf(output,
-			 (MD5_DIGEST_LENGTH * 2) + 1,
-			 "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-			 digest[0],  digest[1],  digest[2],  digest[3],  digest[4],
-			 digest[5],  digest[6],  digest[7],  digest[8],  digest[9],
-			 digest[10], digest[11], digest[12], digest[13], digest[14],
-			 digest[15]);
-}
-
-
-/* parse_hassh() -- parse packets, calculate HASSH
- */
-static void parse_hassh(u_char *args,
-				  const struct pcap_pkthdr *header,
-				  const u_char *packet) {
-	uint32_t		kex_len;
-	uint32_t		hka_len;
-	uint32_t		e_ctos_len;
-	uint32_t		e_stoc_len;
-	uint32_t		mac_ctos_len;
-	uint32_t		mac_stoc_len;
-	uint32_t		compression_len;
-	uint32_t		offset;
-
-	uint8_t			kex_methods[2048]	= {0};
-	uint8_t			e_ctos[2048] = {0};
-	uint8_t			mac_ctos[2048] = {0};
-	uint8_t			compression[2048] = {0};
-
-	struct ip		*ip_header;
-	struct tcphdr	*tcp_header;
-
-
-	/* populate ip and tcphdr structures. set offset to start of data. */
-	ip_header = (struct ip *)(packet);
-	tcp_header = (struct tcphdr *)(packet + sizeof(struct ip));
-	offset = sizeof(struct ip) + sizeof(struct tcphdr);
-
-	/* Look for SSH2_MSG_KEXINIT packets */
-	if (packet[offset + 5] != 0x14) // 0x14 == SSH2_MSG_KEXINIT
-		return;
-
-	/* Don't innundate logs with the server's HASSH. */
-	if ((htons(tcp_header->th_sport) == port) && hassh_server)
-		return;
-
-	/* lol */
-	offset += 25;
-	if (header->len < offset)
-		goto end;
-	kex_len = (packet[offset - 3] << 24) | (packet[offset - 2] << 16) |
-		(packet[offset - 1] << 8) | (packet[offset]);
-	if (kex_len > sizeof(kex_methods))
-		goto end;
-	memcpy(kex_methods, &packet[offset + 1], kex_len);
-	offset += 4 + kex_len;
-
-	if (header->len < offset)
-		goto end;
-	hka_len = (packet[offset - 3] << 24) | (packet[offset - 2] << 16) |
-		(packet[offset - 1] << 8) | (packet[offset]);
-	offset += 4 + hka_len;
-
-	if (header->len < offset)
-		goto end;
-	e_ctos_len = (packet[offset - 3] << 24) | (packet[offset - 2] << 16) |
-		(packet[offset - 1] << 8) | (packet[offset]);
-	if (e_ctos_len > sizeof(e_ctos))
-		goto end;
-	memcpy(e_ctos, &packet[offset + 1], e_ctos_len);
-	offset += 4 + e_ctos_len;
-
-	if (header->len < offset)
-		goto end;
-	e_stoc_len = (packet[offset - 3] << 24) | (packet[offset - 2] << 16) |
-		(packet[offset - 1] << 8) | (packet[offset]);
-	offset += 4 + e_stoc_len;
-
-	if (header->len < offset)
-		goto end;
-	mac_ctos_len = (packet[offset - 3] << 24) | (packet[offset - 2] << 16) |
-		(packet[offset - 1] << 8) | (packet[offset]);
-	if (mac_ctos_len > sizeof(mac_ctos))
-		goto end;
-	memcpy(mac_ctos, &packet[offset + 1], mac_ctos_len);
-	offset += 4 + mac_ctos_len;
-
-	if (header->len < offset)
-		goto end;
-	mac_stoc_len = (packet[offset - 3] << 24) | (packet[offset - 2] << 16) |
-		(packet[offset - 1] << 8) | (packet[offset]);
-	offset += 4 + mac_stoc_len;
-
-	if (header->len < offset)
-		goto end;
-	compression_len = (packet[offset - 3] << 24) | (packet[offset - 2] << 16) |
-		(packet[offset - 1] << 8) | (packet[offset]);
-	if (compression_len > sizeof(compression))
-		goto end;
-	memcpy(compression, &packet[offset + 1], compression_len);
-
-
-	/* calculate HASSH */
-    char hassh[8192];
-	snprintf(hassh, sizeof(hassh), "%s;%s;%s;%s", kex_methods, e_ctos, mac_ctos, compression);
-
-	char hassh_digest[33];
-	md5_digest(hassh, hassh_digest, sizeof(hassh_digest));
-
-	/* Log and output */
-	log_entry("%s: %s %s sport: %d ttl: %d",
-			  htons(tcp_header->th_sport) == port ? "HASSHServer" : "HASSH",
-			  inet_ntoa(ip_header->ip_src),
-			  hassh_digest,
-			  htons(tcp_header->th_sport),
-			  ip_header->ip_ttl);
-
-	if (json_logging_file || json_logging_server)
-		json_log_hassh(hassh_digest,
-					   inet_ntoa(ip_header->ip_src),
-					   htons(tcp_header->th_sport) == port ?
-					   "hasshserver" : "hassh",
-					   htons(tcp_header->th_sport),
-					   ip_header->ip_ttl);
-
-	return;
-
- end:
-	/* Something went wrong! Save pcap, hexdump packet. */
-
-	printf("Shouldn't get here..\n\n");
-}
-
-
-/* handle_ssh_auth() -- handles ssh authentication requests, logging
- *                   -- appropriately.
- */
-static int handle_ssh_auth(ssh_session session) {
-	ssh_message		message;
-	char			*ip;
-	ssh_pcap_file	pcap;
-	char			pcap_file[PATH_MAX];
-	pcap_t			*pd;
-	char			errbuf[PCAP_ERRBUF_SIZE];
-
-
-	snprintf(pcap_file, sizeof(pcap_file), "/tmp/ssh-honeypot-%d.pcap", getpid());
-
-	/* Create pcap file. Necessary to calculate HASSHes. */
-	pcap = ssh_pcap_file_new();
-	if (ssh_pcap_file_open(pcap, pcap_file) == SSH_ERROR) {
-		log_entry("ERROR: Couldnt open pcap file %s: %s\n",
-				  pcap_file, errbuf);
-		ssh_pcap_file_free(pcap);
-	} else {
-		ssh_set_pcap_file(session, pcap);
-	}
-
-	ip = get_ssh_ip(session);
-
-	if (ssh_handle_key_exchange(session)) {
-		if (verbose)
-			log_entry("%s Error exchanging keys: %s", ip, ssh_get_error (session));
-
-		if (json_logging_file || json_logging_server)
-			json_log_kex_error (ip);
-
-		return -1;
-	}
-
-	// TODO log connections to ssh-honeypot.log/stdout?
-
-	char *banner_c   = (char *)ssh_get_clientbanner(session);
-	char *banner_s   = (char *)ssh_get_serverbanner(session);
-	char *kex_algo   = (char *)ssh_get_kex_algo(session);
-	char *cipher_in  = (char *)ssh_get_cipher_in(session);
-	char *cipher_out = (char *)ssh_get_cipher_out(session);
-	char *hmac_in    = (char *)ssh_get_hmac_in(session);
-	char *hmac_out   = (char *)ssh_get_hmac_out(session);
-
-	uint16_t sport, dport;
+/* fill_client_address() -- copy the peer address and source port into client */
+static void fill_client_address(struct client_session *client) {
 	struct sockaddr_storage addr;
 	socklen_t len = sizeof(addr);
+	const void *src = NULL;
 
-	dport = port; // server's port
+	snprintf(client->ip, sizeof(client->ip), "%s", "unknown");
+	client->sport = 0;
 
-	if (getpeername(ssh_get_fd(session), (struct sockaddr *)&addr, &len) == 0) {
-		if (addr.ss_family == AF_INET) {
-			sport = ntohs(((struct sockaddr_in*)&addr)->sin_port);
-		} else if (addr.ss_family == AF_INET6) {
-            sport = ntohs(((struct sockaddr_in6*)&addr)->sin6_port);
-        } else {
-            sport = 0; // Unknown port, handle accordingly
-        }
-    }
+	if (getpeername(ssh_get_fd(client->session), (struct sockaddr *)&addr, &len) != 0)
+		return;
 
-	if (json_logging_file || json_logging_server)
-		json_log_session(ip,
+	if (addr.ss_family == AF_INET)
+		src = &((struct sockaddr_in *)&addr)->sin_addr;
+	else if (addr.ss_family == AF_INET6)
+		src = &((struct sockaddr_in6 *)&addr)->sin6_addr;
+	else
+		return;
+
+	if (inet_ntop(addr.ss_family, src, client->ip, sizeof(client->ip)) == NULL)
+		snprintf(client->ip, sizeof(client->ip), "%s", "unknown");
+
+	if (addr.ss_family == AF_INET)
+		client->sport = ntohs(((struct sockaddr_in *)&addr)->sin_port);
+	else
+		client->sport = ntohs(((struct sockaddr_in6 *)&addr)->sin6_port);
+}
+
+
+/* log_session_info() -- log negotiated session details once kex completes */
+static void log_session_info(struct client_session *client) {
+	ssh_session session = client->session;
+	const char *banner_c   = ssh_get_clientbanner(session);
+	const char *banner_s   = ssh_get_serverbanner(session);
+	const char *kex_algo   = ssh_get_kex_algo(session);
+	const char *cipher_in  = ssh_get_cipher_in(session);
+	const char *cipher_out = ssh_get_cipher_out(session);
+	const char *hmac_in    = ssh_get_hmac_in(session);
+	const char *hmac_out   = ssh_get_hmac_out(session);
+
+	if (banner_c == NULL)   banner_c = "";
+	if (banner_s == NULL)   banner_s = "";
+	if (kex_algo == NULL)   kex_algo = "";
+	if (cipher_in == NULL)  cipher_in = "";
+	if (cipher_out == NULL) cipher_out = "";
+	if (hmac_in == NULL)    hmac_in = "";
+	if (hmac_out == NULL)   hmac_out = "";
+
+	if (json_logging_file || json_logging_server) {
+		json_log_session(client->ip,
 						 banner_c,
 						 banner_s,
-						 sport,
-						 dport,
-						 ssh_get_kex_algo(session),
-						 ssh_get_cipher_in(session),
-						 ssh_get_cipher_out(session),
-						 ssh_get_hmac_in(session),
-						 ssh_get_hmac_out(session));
+						 client->sport,
+						 client->dport,
+						 kex_algo,
+						 cipher_in,
+						 cipher_out,
+						 hmac_in,
+						 hmac_out);
+	}
 
-	if (verbose)
+	if (verbose) {
 		log_entry("Session:  %s|%s|%s|%s|%s|%s|%s",
 				  banner_c,
 				  banner_s,
@@ -619,56 +410,244 @@ static int handle_ssh_auth(ssh_session session) {
 				  cipher_out,
 				  hmac_in,
 				  hmac_out);
-
-	for (;;) {
-		if ((message = ssh_message_get(session)) == NULL)
-			break;
-
-		switch (ssh_message_subtype(message)) {
-			// TODO SSH_AUTH_METHOD_PUBLICKEY
-		case SSH_AUTH_METHOD_PASSWORD:
-			if (json_logging_file || json_logging_server)
-				json_log_creds(ip,
-							   ssh_message_auth_user(message),
-							   ssh_message_auth_password(message));
-
-			log_entry("%s %s %s",
-					  ip,
-					  ssh_message_auth_user(message),
-					  ssh_message_auth_password(message));
-			break;
-
-		default:
-			break;
-			printf("other: %d\n", ssh_message_subtype(message));
-		}
-
-		ssh_message_reply_default(message);
-		ssh_message_free(message);
 	}
+}
 
-	// TODO log end of session? elapsed time, ...
 
-	/* Close pcap file when we're done with it. */
-	ssh_pcap_file_free(pcap);
+/* auth_password_cb() -- log every password attempt and always deny it */
+static int auth_password_cb(ssh_session session,
+							const char *user,
+							const char *password,
+							void *userdata) {
+	struct client_session *client = userdata;
+	const char *username = user != NULL ? user : "";
+	const char *pass     = password != NULL ? password : "";
 
-	/* Calculate HASSH */
-	// TODO this appears to have been failing because the pcap
-	//      wasn't being flushed before attempting to open/read the file.
-	pd = pcap_open_offline(pcap_file, errbuf);
-	if (pd == NULL) {
-		log_entry("ERROR: Unable to open pcap file %s: %s",
-				  pcap_file, errbuf);
-		return 0;
-	} else {
-		pcap_loop(pd, 0, parse_hassh, NULL);
-		pcap_close(pd);
-	}
+	(void)session;
 
-	/* Remove packet capture file */
-	unlink(pcap_file); // TODO error check
+	if (json_logging_file || json_logging_server)
+		json_log_creds(client->ip, username, pass);
+
+	log_entry("%s %s %s", client->ip, username, pass);
+
+	return SSH_AUTH_DENIED;
+}
+
+
+/* service_request_cb() -- allow the ssh-userauth service */
+static int service_request_cb(ssh_session session,
+							  const char *service,
+							  void *userdata) {
+	(void)session;
+	(void)service;
+	(void)userdata;
 
 	return 0;
+}
+
+
+/* channel_open_request_session_cb() -- keep clients out of a shell */
+static ssh_channel channel_open_request_session_cb(ssh_session session,
+												   void *userdata) {
+	(void)session;
+	(void)userdata;
+
+	return NULL;
+}
+
+
+/* client_kex_done() -- transition a client out of key exchange */
+static void client_kex_done(struct client_session *client) {
+	if (client->kex_done)
+		return;
+
+	client->kex_done = true;
+	log_session_info(client);
+}
+
+
+/* client_advance() -- process pending socket events for one client.
+ * Returns false when the client should be removed.
+ */
+static bool client_advance(struct client_session *client, bool ready) {
+	int rc;
+
+	if (ready)
+		client->last_activity = time(NULL);
+
+	if (!client->kex_done) {
+		if (ready) {
+			rc = ssh_handle_key_exchange(client->session);
+			if (rc == SSH_OK) {
+				client_kex_done(client);
+			} else if (rc != SSH_AGAIN) {
+				if (verbose)
+					log_entry("%s Error exchanging keys: %s",
+							  client->ip,
+							  ssh_get_error(client->session));
+
+				if (json_logging_file || json_logging_server)
+					json_log_kex_error(client->ip);
+
+				return false;
+			}
+		}
+	}
+
+	if (client->kex_done && ready) {
+		rc = ssh_event_dopoll(client->event, 0);
+		if (rc == SSH_ERROR)
+			return false;
+	}
+
+	if (ssh_get_status(client->session) & (SSH_CLOSED | SSH_CLOSED_ERROR))
+		return false;
+
+	if (session_timeout > 0 &&
+		time(NULL) - client->last_activity >= session_timeout) {
+		if (verbose)
+			log_entry("%s Session timed out", client->ip);
+
+		return false;
+	}
+
+	return true;
+}
+
+
+/* client_unlink() -- remove a client from the global list */
+static void client_unlink(struct client_session *client) {
+	struct client_session **link = &clients;
+
+	while (*link != NULL) {
+		if (*link == client) {
+			*link = client->next;
+			return;
+		}
+
+		link = &(*link)->next;
+	}
+}
+
+
+/* client_free() -- remove a client from the event loop and free it */
+static void client_free(struct client_session *client) {
+	client_unlink(client);
+
+	if (client->event != NULL) {
+		/* Move the session's poll handles back before freeing the event. */
+		ssh_event_free(client->event);
+	}
+
+	ssh_disconnect(client->session);
+	ssh_free(client->session);
+	free(client);
+}
+
+
+/* client_setup() -- take ownership of a newly accepted session */
+static void client_setup(ssh_session session) {
+	struct client_session *client;
+	int rc;
+
+	client = calloc(1, sizeof(*client));
+	if (client == NULL) {
+		log_entry("ERROR: calloc(): %s", strerror(errno));
+		ssh_disconnect(session);
+		ssh_free(session);
+		return;
+	}
+
+	client->session = session;
+	client->last_activity = time(NULL);
+	client->dport   = port;
+
+	ssh_set_blocking(client->session, 0);
+	fill_client_address(client);
+
+	memset(&client->callbacks, 0, sizeof(client->callbacks));
+	client->callbacks.userdata = client;
+	client->callbacks.auth_password_function = auth_password_cb;
+	client->callbacks.service_request_function = service_request_cb;
+	client->callbacks.channel_open_request_session_function = channel_open_request_session_cb;
+	ssh_callbacks_init(&client->callbacks);
+	ssh_set_server_callbacks(client->session, &client->callbacks);
+	ssh_set_auth_methods(client->session, SSH_AUTH_METHOD_PASSWORD);
+
+	client->event = ssh_event_new();
+	if (client->event == NULL) {
+		log_entry("ERROR: ssh_event_new(): %s", strerror(errno));
+		ssh_disconnect(client->session);
+		ssh_free(client->session);
+		free(client);
+		return;
+	}
+
+	/* Send the server banner and start key exchange. With a nonblocking
+	 * session this returns SSH_AGAIN and the event loop finishes the job.
+	 */
+	rc = ssh_handle_key_exchange(client->session);
+	if (rc == SSH_ERROR) {
+		if (verbose)
+			log_entry("%s Error exchanging keys: %s",
+					  client->ip,
+					  ssh_get_error(client->session));
+
+		if (json_logging_file || json_logging_server)
+			json_log_kex_error(client->ip);
+
+		ssh_event_free(client->event);
+		ssh_disconnect(client->session);
+		ssh_free(client->session);
+		free(client);
+		return;
+	}
+
+	if (ssh_event_add_session(client->event, client->session) == SSH_ERROR) {
+		log_entry("ERROR: ssh_event_add_session(): %s",
+				  ssh_get_error(client->session));
+		ssh_event_free(client->event);
+		ssh_disconnect(client->session);
+		ssh_free(client->session);
+		free(client);
+		return;
+	}
+
+	if (rc == SSH_OK)
+		client_kex_done(client);
+
+	client->next = clients;
+	clients = client;
+}
+
+
+/* client_accept() -- drain pending connections from the listening socket */
+static void client_accept(ssh_bind bind) {
+	for (;;) {
+		ssh_session session = ssh_new();
+		int saved_errno;
+
+		if (session == NULL) {
+			log_entry("ERROR: ssh_new(): %s", strerror(errno));
+			break;
+		}
+
+		if (ssh_bind_accept(bind, session) == SSH_ERROR) {
+			saved_errno = errno;
+			ssh_free(session);
+
+			if (saved_errno == EINTR)
+				continue;
+
+			if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)
+				break;
+
+			log_entry("ERROR: ssh_bind_accept(): %s", ssh_get_error(bind));
+			break;
+		}
+
+		client_setup(session);
+	}
 }
 
 
@@ -730,21 +709,18 @@ void drop_privileges(char *username) {
  */
 int main(int argc, char *argv[]) {
 	pid_t			pid;
-	pid_t			child;
 	int				opt;
 	unsigned short	banner_index = 1;
 	const char		*banner      = banners[1].str;
 	char			*username    = NULL;
-	ssh_session		session;
 	ssh_bind		sshbind;
-	long			timeout      = TIMEOUT;
 	int             i;
 	int             result;
 	int             keys_loaded  = 0;
 	size_t          prefix_len   = strlen(KEY_PREFIX);
 
 
-	while ((opt = getopt(argc, argv, "vh?p:dLl:a:b:i:K:f:su:j:J:P:")) != -1) {
+	while ((opt = getopt(argc, argv, "vh?p:dLl:a:b:i:K:f:t:su:j:J:P:")) != -1) {
 		switch (opt) {
 		case 'p': /* Listen port */
 			port = atoi(optarg);
@@ -781,7 +757,7 @@ int main(int argc, char *argv[]) {
 			break;
 
 		case 't': /* Authentication timeout */
-			timeout = atoi(optarg);
+			session_timeout = atoi(optarg);
 			break;
 
 		case 'u': /* User to drop privileges to */
@@ -855,8 +831,6 @@ int main(int argc, char *argv[]) {
 			log_entry_fatal("FATAL: connect(): %s\n", strerror(errno));
 	}
 
-	signal(SIGCHLD, SIG_IGN);
-
 	if (daemonize) {
 		pid = fork();
 
@@ -879,12 +853,9 @@ int main(int argc, char *argv[]) {
 			  port,
 			  getpid());
 
-	// https://github.com/droberson/ssh-honeypot/issues/21
-	session = ssh_new();
-	ssh_options_set(session, SSH_OPTIONS_TIMEOUT, (void *)&timeout);
-	//ssh_set_auth_methods(session, SSH_AUTH_METHOD_PASSWORD | SSH_AUTH_METHOD_PUBLICKEY);
-
 	sshbind = ssh_bind_new();
+	if (sshbind == NULL)
+		log_entry_fatal("FATAL: ssh_bind_new(): %s", strerror(errno));
 
 	ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDADDR, bindaddr);
 	ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDPORT, &port);
@@ -923,34 +894,90 @@ int main(int argc, char *argv[]) {
 	if (username != NULL)
 		drop_privileges(username);
 
-	for (;;) {
-		if (ssh_bind_accept(sshbind, session) == SSH_ERROR)
-			log_entry_fatal("FATAL: ssh_bind_accept(): %s",
-							ssh_get_error(sshbind));
+	/* Use a non-blocking listening socket so client_accept() can drain all
+	 * pending connections without blocking the event loop.
+	 */
+	result = fcntl(ssh_bind_get_fd(sshbind), F_GETFL, 0);
+	if (result != -1)
+		fcntl(ssh_bind_get_fd(sshbind), F_SETFL, result | O_NONBLOCK);
 
-		child = fork();
+	{
+		struct pollfd *pollfds = NULL;
+		struct client_session **pollclients = NULL;
+		size_t pollcap = 0;
 
-		if (child < 0)
-			log_entry_fatal("FATAL: fork(): %s", strerror(errno));
+		for (;;) {
+			struct client_session *client;
+			size_t nclients = 0;
+			size_t i = 0;
+			int rc;
 
-		if (child == 0) {
-			handle_ssh_auth(session);
-			ssh_free(session);
-			exit(EXIT_SUCCESS);
-		} else {
-			ssh_free(session);
-			session = ssh_new();
-			if (session == NULL) {
-				log_entry_fatal("FATAL: ssh_new(): %s\n", strerror(errno));
+			for (client = clients; client != NULL; client = client->next)
+				nclients++;
+
+			if (nclients + 1 > pollcap) {
+				size_t newcap = pollcap == 0 ? 16 : pollcap;
+
+				while (newcap < nclients + 1)
+					newcap *= 2;
+
+				pollfds = realloc(pollfds,
+								  newcap * sizeof(*pollfds));
+				if (pollfds == NULL)
+					log_entry_fatal("FATAL: realloc(): %s", strerror(errno));
+
+				pollclients = realloc(pollclients,
+									  newcap * sizeof(*pollclients));
+				if (pollclients == NULL)
+					log_entry_fatal("FATAL: realloc(): %s", strerror(errno));
+
+				pollcap = newcap;
+			}
+
+			pollfds[0].fd = ssh_bind_get_fd(sshbind);
+			pollfds[0].events = POLLIN;
+			pollfds[0].revents = 0;
+
+			for (client = clients; client != NULL; client = client->next) {
+				int flags = ssh_get_poll_flags(client->session);
+
+				pollclients[i] = client;
+				pollfds[i + 1].fd = ssh_get_fd(client->session);
+				pollfds[i + 1].events = POLLIN;
+				if (flags & SSH_WRITE_PENDING)
+					pollfds[i + 1].events |= POLLOUT;
+				pollfds[i + 1].revents = 0;
+				i++;
+			}
+
+			rc = poll(pollfds, i + 1, 500);
+			if (rc < 0) {
+				if (errno == EINTR)
+					continue;
+
+				log_entry("ERROR: poll(): %s", strerror(errno));
+				break;
+			}
+
+			if (rc > 0 && (pollfds[0].revents & POLLIN))
+				client_accept(sshbind);
+
+			for (size_t j = 0; j < i; j++) {
+				bool ready = pollfds[j + 1].revents != 0;
+
+				if (!client_advance(pollclients[j], ready))
+					client_free(pollclients[j]);
 			}
 		}
 
-		/* TODO: This may fail if the first connection to ssh-honeypot isn't
-		   initiated by an ssh client. As a result, ssh-honeypot will never
-           emit a hasshserver event.
-		 */
-		hassh_server = true;
+		free(pollfds);
+		free(pollclients);
 	}
+
+	while (clients != NULL)
+		client_free(clients);
+
+	ssh_bind_free(sshbind);
 
 	for (i=0;i<num_key_types;i++) {
 		if (host_keys[i] != NULL) {
