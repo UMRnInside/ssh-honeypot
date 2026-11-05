@@ -17,3 +17,8 @@
   /path/to/keys.rsa for RSA, /path/to/keys.ecdsa for ECDSA,
   and /path/to/keys.ed25519 for Ed25519.
 * Updated built-in banners list.
+
+[0.4.0]
+
+* Replaced per-connection fork() with a single-process libssh event loop.
+* Removed HASSH support and the libpcap dependency.

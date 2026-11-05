@@ -1,7 +1,7 @@
 
 #CFLAGS=-Wall -static-libgcc
 CFLAGS=-Wall
-LIBS=-lssh -ljson-c -lpcap -lssl -lcrypto
+LIBS=-lssh -ljson-c
 
 KEYS_DIR=/etc/ssh-honeypot
 
@@ -12,7 +12,8 @@ ED25519=$(KEYS_DIR)/ssh-honeypot.ed25519
 .PHONY: install install-etc clean ssh-honeypot
 ssh-honeypot: bin/ssh-honeypot
 
-bin/ssh-honeypot:
+bin/ssh-honeypot: src/ssh-honeypot.c src/config.h
+	mkdir -p bin
 	$(CC) $(CFLAGS) -o bin/ssh-honeypot src/ssh-honeypot.c $(LIBS)
 
 clean:

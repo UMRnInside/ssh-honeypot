@@ -8,6 +8,10 @@ or attackers to login.
 This was originally written to gather rudimentary intelligence on
 brute force attacks and not meant for production usage.
 
+This fork removes the original ssh-honeypot HASSH module and uses a
+single-process event loop instead of forking a child process for every
+client.
+
 Nowadays, I mostly use this at attack/defend CTFs paired with sshunt:
 https://github.com/droberson/sshunt
 
@@ -22,12 +26,10 @@ to ssh-honeypot and allow OpenSSH clients to connect to ssh normally.
 Make sure headers/development packages are installed for:
 
 - libssh
-- openssl
 - libjson-c
-- libpcap
 
 ```
-apt install libssh-dev libjson-c-dev libpcap-dev libssl-dev
+apt install libssh-dev libjson-c-dev
 ```
 
 Build and Run
@@ -50,9 +52,9 @@ key file must be available; otherwise, ssh-honeypot will fail to start.
 
 ### OSX (experimental/unsupported)
 
-_WARNING: I haven't tested JSON logging, HASSH, or anything really on
-OSX. MacOS is officially unsupported as I do not own any Macs to test
-this software with._
+_WARNING: I haven't tested JSON logging or anything really on OSX.
+MacOS is officially unsupported as I do not own any Macs to test this
+software with._
 
 Make sure that xcode is up to date.
 
@@ -73,17 +75,6 @@ make -f MakefileOSX
 
 Please take a look at our [Docker documentation](docker/README.md).
 
-
-## HASSH
-
-As of version 0.2.0, ssh-honeypot attempts to calculate the HASSH of
-the client software initiating sessions with ssh-honeypot. In short,
-you can tell if the client is using OpenSSH, PuTTY, SecureCRT, ...
-
-For more information about HASSH, refer to these links:
-
-- https://github.com/salesforce/hassh
-- https://engineering.salesforce.com/open-sourcing-hassh-abed3ae5044c
 
 ## Syslog facilities
 
@@ -156,6 +147,11 @@ automatically runs at system startup:
 make install
 systemctl enable --now ssh-honeypot
 ```
+
+The default unit runs as a systemd dynamic user, keeps file descriptors
+for up to 16384 connections, and reads the host keys from
+`/etc/ssh-honeypot` through `LoadCredential=`. `make install` generates
+all three key types.
 
 Before installing, check `ssh-honeypot.service` and modify it to run
 with the options you want.
