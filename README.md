@@ -12,11 +12,13 @@ This fork removes the original ssh-honeypot HASSH module and uses a
 single-process event loop instead of forking a child process for every
 client.
 
-Nowadays, I mostly use this at attack/defend CTFs paired with sshunt:
-https://github.com/droberson/sshunt
-
-I set up sshunt to forward tools such as Hydra, Metasploit, and Ncrack
-to ssh-honeypot and allow OpenSSH clients to connect to ssh normally.
+> Nowadays, I mostly use this at attack/defend CTFs paired with sshunt:
+> https://github.com/droberson/sshunt
+> 
+> I set up sshunt to forward tools such as Hydra, Metasploit, and Ncrack
+> to ssh-honeypot and allow OpenSSH clients to connect to ssh normally.
+>
+> --Daniel Roberson, in droberson/ssh-honeypot README.md
 
 
 ## Quickstart
